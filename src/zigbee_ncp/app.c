@@ -8,14 +8,14 @@
  *
  * Modified from NabuCasa original to add Green Power MultiRail support.
  * When a bidirectional GP frame (rxAfterTx=1) is detected at MAC level,
- * the NCP schedules a pre-queued response (0xF0 Commissioning Reply) via
- * a second RAIL instance at exactly GP_RX_OFFSET_USEC after the incoming
- * frame.  If RAIL2 scheduling fails the queue entry is left intact so the
- * NCP native GP stub can still attempt the send.
+ * the NCP automatically schedules a pre-queued response (0xF0 Commissioning
+ * Reply) via a second RAIL instance at exactly GP_RX_OFFSET_USEC after the
+ * incoming frame — entirely on the NCP, no host round-trip required.
  *
  * Drop-in replacement for:
  *   src/zigbee_ncp/app.c
  * in a fork of https://github.com/NabuCasa/silabs-firmware-builder
+ *
  ******************************************************************************/
 
 #include PLATFORM_HEADER
@@ -35,70 +35,65 @@ void emberAfRadioNeedsCalibratingCallback(void)
 
 // ============================================================================
 // Green Power MultiRail support
-// Requires component zigbee_multirail_demo in the build.
-//
-// Host (bellows) pre-queues the 0xF0 Commissioning Reply via dGpSend (EZSP
-// 0xC6) before the sensor button is pressed.  When the GPD sends 0xE0 (with
-// rxAfterTx=1), sli_zigbee_af_packet_handoff_incoming_callback fires at MAC
+// Requires component zigbee_multirail_demo to be present in the build.
+// The host (bellows) pre-queues the 0xF0 Commissioning Reply via dGpSend
+// (EZSP 0xC6) before the user presses the sensor button.  When the GPD sends
+// 0xE0 (with rxAfterTx=1), the packet-handoff callback below fires at MAC
 // level, finds the pre-queued frame and schedules hardware-timed RAIL2
 // transmission at exactly GP_RX_OFFSET_USEC.
-//
-// IMPORTANT: the queue entry is removed from the GP stub TX queue ONLY after
-// RAIL2 successfully schedules the TX (RAIL_STATUS_NO_ERROR).  If RAIL2
-// scheduling fails, the entry is left in the queue so the NCP native GP stub
-// can still attempt a send on the next occasion.
 // ============================================================================
 
 #if defined(SL_CATALOG_ZIGBEE_MULTIRAIL_DEMO_PRESENT)
 #include "multirail-demo.h"
 #include "stack/include/gp-types.h"
-#include "rail.h"
 
-// Time (us) between GPD Tx end and its receive-window opening.
+// Time (µs) between GPD Tx and its receive-window opening.
 // Per ZGP spec the GPD opens its window at dGPD_RX_OFFSET = 20 ms.
-// We use 20000 us (not 20500) to err on the early side.
+// 20500 µs gives a small safety margin.
 #ifndef GP_RX_OFFSET_USEC
-#define GP_RX_OFFSET_USEC 20000
+#define GP_RX_OFFSET_USEC 20500
 #endif
 
-// Internal SiLabs stack helpers (stable internal symbols).
+// Internal SiLabs stack helpers (not in public headers, but stable).
 extern uint8_t sl_mac_lower_mac_get_radio_channel(uint8_t mac_index);
 extern EmberMessageBuffer sli_zigbee_gpdf_make_header(bool useCca,
                                                       EmberGpAddress *src,
                                                       EmberGpAddress *dst);
 
-// Stack-internal global: RAIL timer value (us) at the time the current MAC
-// frame was received.  Set before our packet-handoff callback fires.
+// Stack-internal global: RAIL timer value (µs) at the time the current MAC
+// frame was received.  Set by sli_zigbee_application_process_incoming()
+// before it invokes the packet-handoff callback, so it is always valid when
+// our sli_zigbee_af_packet_handoff_incoming_callback() fires.
+// Used to compensate for the main-loop dispatch latency so that RAIL2
+// schedules the GP response at exactly GP_RX_OFFSET_USEC after MAC reception.
 extern uint32_t sli_zigbee_current_mac_timestamp;
-
-// Diagnostic counters (readable via emberGetCounters indirectly; mainly for
-// debug builds).  Reset on each commissioning attempt.
-static uint16_t gp_multirail_filter_pass  = 0;
-static uint16_t gp_multirail_queue_found  = 0;
-static uint16_t gp_multirail_rail2_ok     = 0;
-static uint16_t gp_multirail_rail2_fail   = 0;
 
 // Forward declaration
 static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
-                                      uint8_t *packetData,
-                                      uint8_t size_p);
+                                      int8u *packetData,
+                                      int8u size_p);
 
-/** @brief Application init -- initialise the second RAIL instance. */
+/** @brief Application init — initialise the second RAIL instance.
+ *
+ * The second RAIL handle is used to send hardware-timed GP frames.
+ * Parameters mirror the primary Zigbee radio so no additional calibration
+ * is needed.
+ */
 void emberAfMainInitCallback(void)
 {
   emberAfPluginMultirailDemoInit(
-    NULL,                                         // default RAIL config
+    NULL,                                         // use default RAIL config
     NULL,                                         // copy TX power from RAIL 1
     true,                                         // PA auto-mode
     RAIL_GetTxPowerDbm(emberGetRailHandle()),      // same TX power as RAIL 1
-    NULL,                                         // default 128-byte FIFO
-    0,                                            // txFifoSize (ignored when NULL)
+    NULL,                                         // use default 128-byte FIFO
+    0,
     0xFFFF,                                       // no PAN filter
     NULL                                          // no IEEE address filter
     );
 }
 
-/** @brief RAIL2 event callback. */
+/** @brief RAIL2 event callback — nothing to do for GP scheduling. */
 void emberAfPluginMultirailDemoRailEventCallback(RAIL_Handle_t handle,
                                                  RAIL_Events_t events)
 {
@@ -106,67 +101,65 @@ void emberAfPluginMultirailDemoRailEventCallback(RAIL_Handle_t handle,
   (void)events;
 }
 
-/** @brief Get and serialise one TX queue entry for the given GPD address.
+/** @brief Retrieve and serialise one entry from the dGpSend TX queue for the
+ *  given GPD address.
  *
- *  Fills *outPkt with a RAIL-ready packet (length byte + MAC frame + 2 CRC
- *  placeholder bytes) and returns the total byte count, or 0 on failure.
- *
- *  NOTE: does NOT remove the entry from the queue.  The caller must call
- *  emberGpRemoveFromTxQueue() explicitly after a successful RAIL2 send.
+ *  The caller must free the returned entry's asdu buffer after use.
+ *  Returns NULL if no entry is found or RAIL2 is not yet initialised.
  */
-static uint8_t get_gp_stub_tx_packet(EmberGpAddress *addr,
-                                     uint8_t *outPkt,
-                                     uint8_t maxLen)
+static EmberGpTxQueueEntry *get_gp_stub_tx_queue(EmberGpAddress *addr)
 {
-  if (!emberAfPluginMultirailDemoGetHandle()) {
-    return 0;  // RAIL2 not initialised
-  }
+  EmberGpTxQueueEntry sli_zigbee_gp_tx_queue;
+  MEMCOPY(&sli_zigbee_gp_tx_queue.addr, addr, sizeof(EmberGpAddress));
 
-  EmberGpTxQueueEntry queueEntry;
-  MEMSET(&queueEntry, 0, sizeof(queueEntry));
-  MEMCOPY(&queueEntry.addr, addr, sizeof(EmberGpAddress));
+  uint8_t data[128];
+  uint16_t dataLength;
 
-  uint8_t asduData[128];
-  uint16_t asduLen = 0;
+  if (emberAfPluginMultirailDemoGetHandle()
+      && emberGpGetTxQueueEntryFromQueue(&sli_zigbee_gp_tx_queue,
+                                         data,
+                                         &dataLength,
+                                         128) != EMBER_NULL_MESSAGE_BUFFER) {
+    // Build a MAC frame for this GP TX queue entry
+    EmberMessageBuffer header = sli_zigbee_gpdf_make_header(
+      true, NULL, &(sli_zigbee_gp_tx_queue.addr));
 
-  if (emberGpGetTxQueueEntryFromQueue(&queueEntry, asduData, &asduLen, 128)
-      == EMBER_NULL_MESSAGE_BUFFER) {
-    return 0;  // no matching entry in queue
-  }
+    // Append the GP command ID
+    uint8_t len = emberMessageBufferLength(header) + 1;
+    emberAppendToLinkedBuffers(header,
+                               &(sli_zigbee_gp_tx_queue.gpdCommandId), 1);
 
-  // Build the GP MAC frame: header + commandId + ASDU payload
-  EmberMessageBuffer header = sli_zigbee_gpdf_make_header(
-    false, NULL, &queueEntry.addr);   // useCca=false for GP response
-  if (header == EMBER_NULL_MESSAGE_BUFFER) {
-    return 0;
-  }
+    // Append the GP command payload
+    emberSetLinkedBuffersLength(header,
+                                emberMessageBufferLength(header) + dataLength);
+    emberCopyToLinkedBuffers(data, header, len, dataLength);
 
-  // Append GP command ID and ASDU
-  emberAppendToLinkedBuffers(header, &queueEntry.gpdCommandId, 1);
-  if (asduLen > 0) {
-    uint8_t hdrLen = emberMessageBufferLength(header);
-    emberSetLinkedBuffersLength(header, hdrLen + asduLen);
-    emberCopyToLinkedBuffers(asduData, header, hdrLen, asduLen);
-  }
+    // Remove from the stub queue — we are taking ownership
+    emberGpRemoveFromTxQueue(&sli_zigbee_gp_tx_queue);
 
-  // Serialise: [total_len_incl_2crc | mac_frame_bytes | crc_placeholder x2]
-  uint8_t frameLen = emberMessageBufferLength(header);
-  uint8_t totalLen = 1 + frameLen + 2;  // length byte + frame + 2 CRC
-  if (totalLen > maxLen) {
+    // Serialise into a flat RAIL frame:
+    // [Total length (excl. itself) | MAC frame bytes | 2-byte CRC placeholder]
+    uint8_t outPktLength = emberMessageBufferLength(header);
+    uint8_t outPkt[128];
+    outPkt[0] = outPktLength + 2;
+    emberCopyFromLinkedBuffers(header, 0, &outPkt[1], outPktLength);
     emberReleaseMessageBuffer(header);
-    return 0;
+
+    // Return a static copy (one entry at a time is fine for GP commissioning)
+    static EmberGpTxQueueEntry copyOfGpStubTxQueue;
+    copyOfGpStubTxQueue.inUse = true;
+    copyOfGpStubTxQueue.asdu = emberFillLinkedBuffers(outPkt, (outPkt[0] + 1));
+    MEMCOPY(&(copyOfGpStubTxQueue.addr), addr, sizeof(EmberGpAddress));
+    return &copyOfGpStubTxQueue;
   }
-
-  outPkt[0] = frameLen + 2;  // PHY length field (frame + CRC)
-  emberCopyFromLinkedBuffers(header, 0, &outPkt[1], frameLen);
-  outPkt[1 + frameLen]     = 0x00;  // CRC placeholder (radio fills in)
-  outPkt[1 + frameLen + 1] = 0x00;
-  emberReleaseMessageBuffer(header);
-
-  return totalLen;
+  return NULL;
 }
 
-/** @brief Packet handoff -- called for every incoming raw MAC frame. */
+/** @brief Packet handoff — called for every incoming raw MAC frame.
+ *
+ *  Passes the frame to appGpScheduleOutgoingGpdf and always accepts it
+ *  so normal stack processing continues.
+ */
 EmberPacketAction sli_zigbee_af_packet_handoff_incoming_callback(
   EmberZigbeePacketType packetType,
   EmberMessageBuffer packetBuffer,
@@ -181,73 +174,95 @@ EmberPacketAction sli_zigbee_af_packet_handoff_incoming_callback(
   return EMBER_ACCEPT_PACKET;
 }
 
-/** @brief Schedule a pre-queued GP response via RAIL2 for the bidirectional
- *  GP frame receive window.
+/** @brief Schedule a pre-queued GP response via RAIL2 if the incoming frame
+ *  is a bidirectional GP frame (rxAfterTx = 1) with enough time remaining
+ *  before the GPD's receive window.
  *
- *  MAC frame layout (GP broadcast, short dst, no src address):
- *    [0-1]  Frame Control
+ *  MAC frame layout (GP broadcast, no source address):
+ *    [0-1]  FC (Frame Control)
  *    [2]    Sequence number
  *    [3-4]  Destination PAN ID
- *    [5-6]  Destination address (0xFFFF)
+ *    [5-6]  Destination address (0xFFFF broadcast)
  *    [7]    NWK FC byte
- *    [8]    NWK ExtFC byte  (when ExtFC-present bit set in [7])
- *    [9-12] GPD Source ID   (when AppId = 0 in ExtFC)
+ *    [8]    NWK ExtFC byte  (if ExtFC-present bit set in [7])
+ *    [9-12] GPD Source ID   (if AppId = 0 in ExtFC)
+ *
+ *  NWK FC bits of interest:
+ *    b7    = ExtFC present
+ *    b6    = Auto-Commissioning (AC)
+ *    b5-b2 = Protocol Version  (must be 0b0011 = 3 for GP)
+ *    b1-b0 = Frame Type        (0=Data, 1=Maintenance)
+ *
+ *  NWK ExtFC bits:
+ *    b7    = Direction (0 = from GPD)
+ *    b6    = RxAfterTx
+ *    b2-b0 = AppId    (0 = SrcID-based)
+ *
+ *  Timing:
+ *    sli_zigbee_current_mac_timestamp holds the RAIL timer value (µs) at
+ *    the time the MAC frame was received, set by the stack before calling
+ *    this callback.  We subtract it from RAIL_GetTime() to get the exact
+ *    main-loop dispatch latency and schedule RAIL2 TX to fire at precisely
+ *    GP_RX_OFFSET_USEC after MAC reception regardless of that latency.
  */
 static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
-                                      uint8_t *packetData,
-                                      uint8_t size_p)
+                                      int8u *packetData,
+                                      int8u size_p)
 {
-  if (packetType != EMBER_ZIGBEE_PACKET_TYPE_RAW_MAC || size_p < 13) {
+  if (packetType != EMBER_ZIGBEE_PACKET_TYPE_RAW_MAC || size_p <= 9) {
     return;
   }
 
   uint8_t nwkFc  = packetData[7];
   uint8_t nwkEfc = packetData[8];
 
-  // Only GP frames (Protocol Version = 3, bits b5-b2 = 0b0011 = 0x0C)
+  // Only GP frames (Protocol Version = 3, bits b5-b2 = 0b0011)
   if ((nwkFc & 0x3C) != 0x0C) {
     return;
   }
 
-  // We only care about data frames with rxAfterTx=1:
-  //   nwkFc bits: b7=ExtFC-present=1, b1-b0=FT=0 (data), AC bit ignored
-  //   nwkEfc bits: b7=Dir=0 (from GPD), b6=rxAfterTx=1
-  bool isDataRxAfterTx = ((nwkFc  & 0x83) == 0x80)   // FT=data, ExtFC=1
+  bool isMaintenance = ((nwkFc & 0xC3) == 0x01);  // FT=1, ExtFC=0, AC=0
+  bool isDataRxAfterTx = ((nwkFc & 0x83) == 0x80) // FT=0, ExtFC=1 (AC bit ignored)
                          && ((nwkEfc & 0xC0) == 0x40); // Dir=0, rxAfterTx=1
 
-  if (!isDataRxAfterTx) {
+  if (!isMaintenance && !isDataRxAfterTx) {
     return;
   }
-
-  // Only SrcID mode (AppId = 0b000)
-  if ((nwkEfc & 0x07) != EMBER_GP_APPLICATION_SOURCE_ID) {
-    return;
-  }
-
-  gp_multirail_filter_pass++;
 
   // Compute latency since MAC reception.
+  // sli_zigbee_current_mac_timestamp is a RAIL µs value written by the stack
+  // in sli_zigbee_application_process_incoming() before our callback fires.
   uint32_t elapsed = RAIL_GetTime() - sli_zigbee_current_mac_timestamp;
   if (elapsed >= GP_RX_OFFSET_USEC) {
-    return;  // too late
+    // Too late — the GPD receive window has already closed.
+    return;
   }
 
-  // Extract GPD Source ID from MAC payload
+  // Extract GPD Source ID from the NWK frame (AppId = 0 assumed)
   EmberGpAddress gpdAddr;
-  MEMSET(&gpdAddr, 0, sizeof(gpdAddr));
   gpdAddr.applicationId = EMBER_GP_APPLICATION_SOURCE_ID;
-  MEMCOPY(&gpdAddr.id.sourceId, &packetData[9], sizeof(EmberGpSourceId));
+  gpdAddr.id.sourceId = 0;
 
-  // Build the RAIL TX packet from the pre-queued GP TX stub entry.
-  // NOTE: entry remains in queue until we explicitly call emberGpRemoveFromTxQueue.
-  uint8_t outPkt[128];
-  uint8_t outPktLen = get_gp_stub_tx_packet(&gpdAddr, outPkt, sizeof(outPkt));
-  if (outPktLen == 0) {
-    return;  // no entry or RAIL2 not ready
+  if (isDataRxAfterTx
+      && ((nwkEfc & 0x07) == EMBER_GP_APPLICATION_SOURCE_ID)) {
+    (void)memcpy(&gpdAddr.id.sourceId, &packetData[9],
+                 sizeof(EmberGpSourceId));
   }
 
-  gp_multirail_queue_found++;
+  // Look for a pre-queued response for this GPD
+  EmberGpTxQueueEntry *entry = get_gp_stub_tx_queue(&gpdAddr);
+  if (!entry) {
+    return;
+  }
 
+  // Serialise the queued MAC frame
+  uint8_t outPktLength = emberMessageBufferLength(entry->asdu);
+  uint8_t outPkt[128];
+  emberCopyFromLinkedBuffers(entry->asdu, 0, outPkt, outPktLength);
+
+  // Schedule RAIL2 transmission to hit the GPD receive window exactly.
+  // when = GP_RX_OFFSET_USEC - elapsed fires at MAC_RX_time + GP_RX_OFFSET_USEC,
+  // compensating for the main-loop dispatch latency measured above.
   RAIL_SchedulerInfo_t schedulerInfo = {
     .priority        = 50,
     .slipTime        = 2000,
@@ -258,27 +273,14 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
     .when = GP_RX_OFFSET_USEC - elapsed,
   };
 
-  RAIL_Status_t status = emberAfPluginMultirailDemoSend(
+  (void)emberAfPluginMultirailDemoSend(
     outPkt,
-    outPktLen,
+    outPktLength,
     sl_mac_lower_mac_get_radio_channel(0),
     &scheduledTxConfig,
     &schedulerInfo);
 
-  if (status == RAIL_STATUS_NO_ERROR) {
-    // RAIL2 TX scheduled successfully.
-    // Remove from the GP stub queue so the native stub does not double-send.
-    gp_multirail_rail2_ok++;
-    EmberGpTxQueueEntry removeEntry;
-    MEMSET(&removeEntry, 0, sizeof(removeEntry));
-    MEMCOPY(&removeEntry.addr, &gpdAddr, sizeof(EmberGpAddress));
-    emberGpRemoveFromTxQueue(&removeEntry);
-  } else {
-    // RAIL2 scheduling failed.
-    // Leave the entry in the queue so the NCP native GP stub can still
-    // attempt to send it (may be slightly late but better than nothing).
-    gp_multirail_rail2_fail++;
-  }
+  emberGpRemoveFromTxQueue(entry);
 }
 
 #endif // SL_CATALOG_ZIGBEE_MULTIRAIL_DEMO_PRESENT
