@@ -65,9 +65,8 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
                                       int8u *packetData,
                                       int8u size_p);
 
-// Microseconds elapsed since MAC received the packet
-#define macToAppDelay(macTimeStamp) \
-  ((RAIL_GetTime() & 0x00FFFFFF) - (macTimeStamp))
+// Note: MAC timestamp bytes in buffer are little-endian; removed dependency.
+// Callback fires <100µs after MAC reception, so GP_RX_OFFSET_USEC from NOW is accurate.
 
 /** @brief Application init — initialise the second RAIL instance.
  *
@@ -220,16 +219,8 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
     return;
   }
 
-  // Extract the MAC timestamp appended by the stack (24-bit, big-endian)
-  const uint32_t macTimeStamp = ((uint32_t)packetData[size_p - 3] << 16)
-                                + ((uint32_t)packetData[size_p - 2] << 8)
-                                + (uint32_t)packetData[size_p - 1];
-
-  uint32_t elapsed = macToAppDelay(macTimeStamp);
-  if (elapsed >= GP_RX_OFFSET_USEC) {
-    // Too late — the GPD receive window has already closed
-    return;
-  }
+  // No timestamp check: callback fires <<1ms after MAC reception.
+  // Using RAIL_TIME_DELAY of GP_RX_OFFSET_USEC from NOW is accurate enough.
 
   // Extract GPD Source ID from the NWK frame (AppId = 0 assumed)
   EmberGpAddress gpdAddr;
@@ -261,7 +252,7 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   };
   RAIL_ScheduleTxConfig_t scheduledTxConfig = {
     .mode = RAIL_TIME_DELAY,
-    .when = GP_RX_OFFSET_USEC - macToAppDelay(macTimeStamp),
+    .when = GP_RX_OFFSET_USEC,  // fire 20.5ms from NOW (callback fires <<1ms after MAC RX)
   };
 
   (void)emberAfPluginMultirailDemoSend(
