@@ -60,13 +60,18 @@ extern EmberMessageBuffer sli_zigbee_gpdf_make_header(bool useCca,
                                                       EmberGpAddress *src,
                                                       EmberGpAddress *dst);
 
+// Stack-internal global: RAIL timer value (µs) at the time the current MAC
+// frame was received.  Set by sli_zigbee_application_process_incoming()
+// before it invokes the packet-handoff callback, so it is always valid when
+// our sli_zigbee_af_packet_handoff_incoming_callback() fires.
+// Used to compensate for the main-loop dispatch latency so that RAIL2
+// schedules the GP response at exactly GP_RX_OFFSET_USEC after MAC reception.
+extern uint32_t sli_zigbee_current_mac_timestamp;
+
 // Forward declaration
 static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
                                       int8u *packetData,
                                       int8u size_p);
-
-// Note: MAC timestamp bytes in buffer are little-endian; removed dependency.
-// Callback fires <100µs after MAC reception, so GP_RX_OFFSET_USEC from NOW is accurate.
 
 /** @brief Application init — initialise the second RAIL instance.
  *
@@ -181,8 +186,6 @@ EmberPacketAction sli_zigbee_af_packet_handoff_incoming_callback(
  *    [7]    NWK FC byte
  *    [8]    NWK ExtFC byte  (if ExtFC-present bit set in [7])
  *    [9-12] GPD Source ID   (if AppId = 0 in ExtFC)
- *    ...
- *    [size_p-3..size_p-1]  MAC timestamp (appended by stack, big-endian 24-bit)
  *
  *  NWK FC bits of interest:
  *    b7    = ExtFC present
@@ -194,6 +197,13 @@ EmberPacketAction sli_zigbee_af_packet_handoff_incoming_callback(
  *    b7    = Direction (0 = from GPD)
  *    b6    = RxAfterTx
  *    b2-b0 = AppId    (0 = SrcID-based)
+ *
+ *  Timing:
+ *    sli_zigbee_current_mac_timestamp holds the RAIL timer value (µs) at
+ *    the time the MAC frame was received, set by the stack before calling
+ *    this callback.  We subtract it from RAIL_GetTime() to get the exact
+ *    main-loop dispatch latency and schedule RAIL2 TX to fire at precisely
+ *    GP_RX_OFFSET_USEC after MAC reception regardless of that latency.
  */
 static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
                                       int8u *packetData,
@@ -219,8 +229,14 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
     return;
   }
 
-  // No timestamp check: callback fires <<1ms after MAC reception.
-  // Using RAIL_TIME_DELAY of GP_RX_OFFSET_USEC from NOW is accurate enough.
+  // Compute latency since MAC reception.
+  // sli_zigbee_current_mac_timestamp is a RAIL µs value written by the stack
+  // in sli_zigbee_application_process_incoming() before our callback fires.
+  uint32_t elapsed = RAIL_GetTime() - sli_zigbee_current_mac_timestamp;
+  if (elapsed >= GP_RX_OFFSET_USEC) {
+    // Too late — the GPD receive window has already closed.
+    return;
+  }
 
   // Extract GPD Source ID from the NWK frame (AppId = 0 assumed)
   EmberGpAddress gpdAddr;
@@ -244,7 +260,9 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   uint8_t outPkt[128];
   emberCopyFromLinkedBuffers(entry->asdu, 0, outPkt, outPktLength);
 
-  // Schedule RAIL2 transmission to hit the GPD receive window exactly
+  // Schedule RAIL2 transmission to hit the GPD receive window exactly.
+  // when = GP_RX_OFFSET_USEC - elapsed fires at MAC_RX_time + GP_RX_OFFSET_USEC,
+  // compensating for the main-loop dispatch latency measured above.
   RAIL_SchedulerInfo_t schedulerInfo = {
     .priority        = 50,
     .slipTime        = 2000,
@@ -252,7 +270,7 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   };
   RAIL_ScheduleTxConfig_t scheduledTxConfig = {
     .mode = RAIL_TIME_DELAY,
-    .when = GP_RX_OFFSET_USEC,  // fire 20.5ms from NOW (callback fires <<1ms after MAC RX)
+    .when = GP_RX_OFFSET_USEC - elapsed,
   };
 
   (void)emberAfPluginMultirailDemoSend(
