@@ -222,7 +222,7 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   }
 
   bool isMaintenance = ((nwkFc & 0xC3) == 0x01);  // FT=1, ExtFC=0, AC=0
-  bool isDataRxAfterTx = ((nwkFc & 0xC3) == 0x80) // FT=0, ExtFC=1, AC=0
+  bool isDataRxAfterTx = ((nwkFc & 0x83) == 0x80) // FT=0, ExtFC=1 (AC bit ignored)
                          && ((nwkEfc & 0xC0) == 0x40); // Dir=0, rxAfterTx=1
 
   if (!isMaintenance && !isDataRxAfterTx) {
