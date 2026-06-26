@@ -8,6 +8,15 @@
  *
  * Modified from NabuCasa original to add Green Power MultiRail support.
  *
+ * GP commissioning frame handling:
+ *   - 0xE3 (Channel Request, frame_type=1 Maintenance): arrives as
+ *     EMBER_ZIGBEE_PACKET_TYPE_RAW_MAC with full MAC header; NWK FC at [7].
+ *   - 0xE0 (Commissioning, frame_type=0 Data): arrives as a non-RAW_MAC type
+ *     (NWK-layer) with the MAC header already stripped by the Ember stack;
+ *     NWK FC at [0].
+ *   We handle both by branching on EMBER_ZIGBEE_PACKET_TYPE_RAW_MAC.
+ *   Any non-GP frame is quickly rejected by the GP protocol version check.
+ *
  ******************************************************************************/
 
 #include PLATFORM_HEADER
@@ -30,7 +39,8 @@ extern uint8_t sl_mac_lower_mac_get_radio_channel(uint8_t mac_index);
 extern EmberMessageBuffer sli_zigbee_gpdf_make_header(bool useCca,
                                                       EmberGpAddress *src,
                                                       EmberGpAddress *dst);
-// May be stale for GP data frames (0xE0) — see comment below.
+// Only reliably updated for RAW_MAC frames (GP maintenance); may be stale
+// for NWK-layer frames (GP data).  See elapsed fallback below.
 extern uint32_t sli_zigbee_current_mac_timestamp;
 
 static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
@@ -105,86 +115,70 @@ EmberPacketAction sli_zigbee_af_packet_handoff_incoming_callback(
   return EMBER_ACCEPT_PACKET;
 }
 
-/** @brief Schedule a pre-queued GP response via RAIL2.
- *
- *  Supports two incoming packet types:
- *
- *  RAW_MAC (frame_type=1, GP Maintenance frames like 0xE3):
- *    The callback receives the full 802.15.4 MAC frame.  `index`=0, so
- *    packetData[0..6] = MAC header, packetData[7] = NWK FC.
- *    Layout: [FC(2)][Seq(1)][DestPAN(2)][DestAddr(2)][NWK FC][NWK ExtFC][SrcID(4)]
- *
- *  NWK / NWK_ENCRYPTED (frame_type=0, GP Data frames like 0xE0):
- *    The Ember stack classifies GP data frames (frame_type=0) as NWK-layer
- *    packets and strips the MAC header before calling this hook.  `index`
- *    points to the NWK layer, so packetData[0] = NWK FC directly.
- *    Layout: [NWK FC][NWK ExtFC][SrcID(4)][SecFC(4)][Cmd][Payload]
- *
- *  NWK FC bits:
- *    b7    = ExtFC present
- *    b6    = Auto-Commissioning (AC)  [b5-b2 = proto ver = 3]
- *    b1-b0 = Frame Type (0=Data, 1=Maintenance)
- *
- *  NWK ExtFC bits:
- *    b7    = Direction (0 = from GPD)
- *    b6    = RxAfterTx
- *    b2-b0 = AppId (0 = SrcID)
- *
- *  Timing note:
- *    sli_zigbee_current_mac_timestamp is only reliably set for RAW_MAC frames.
- *    For NWK-type frames it may hold a stale value from the previous RAW_MAC
- *    frame (seconds old).  We guard isDataRxAfterTx against this by falling
- *    back to elapsed=0 when elapsed >= GP_RX_OFFSET_USEC, scheduling RAIL2 TX
- *    at GP_RX_OFFSET_USEC from now (jitter = main-loop dispatch latency < 5ms).
- */
 static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
                                       int8u *packetData,
                                       int8u size_p)
 {
-  // Determine NWK header offset in packetData.
-  //   RAW_MAC / RAW_MAC_ENCRYPTED: NWK starts at byte 7 (after MAC header)
-  //   NWK / NWK_ENCRYPTED:         NWK starts at byte 0 (MAC already stripped)
+  // Choose NWK header offset based on packet type.
+  //
+  // EMBER_ZIGBEE_PACKET_TYPE_RAW_MAC:
+  //   Full 802.15.4 frame: [FC(2)][Seq(1)][DestPAN(2)][DestAddr(2)][NWK...]
+  //   NWK FC is at packetData[7].
+  //
+  // All other types (NWK-layer, etc.):
+  //   Ember has already stripped the MAC header; the callback receives only
+  //   the NWK payload.  NWK FC is at packetData[0].
+  //   GP data frames (0xE0, frame_type=0) fall into this category.
+  //
+  // Any non-GP frame is rejected by the GP protocol version check below.
   uint8_t nwkOffset;
-  if (packetType == EMBER_ZIGBEE_PACKET_TYPE_RAW_MAC
-      || packetType == EMBER_ZIGBEE_PACKET_TYPE_RAW_MAC_ENCRYPTED) {
-    if (size_p < 10) return;
+  if (packetType == EMBER_ZIGBEE_PACKET_TYPE_RAW_MAC) {
+    if (size_p < 10) {
+      return;
+    }
     nwkOffset = 7;
-  } else if (packetType == EMBER_ZIGBEE_PACKET_TYPE_NWK
-             || packetType == EMBER_ZIGBEE_PACKET_TYPE_NWK_ENCRYPTED) {
-    if (size_p < 3) return;
-    nwkOffset = 0;
   } else {
-    return;
+    if (size_p < 6) {
+      return;
+    }
+    nwkOffset = 0;
   }
 
   uint8_t nwkFc  = packetData[nwkOffset];
   uint8_t nwkEfc = packetData[nwkOffset + 1];
 
-  // Only GP frames (Protocol Version = 3, bits b5-b2 = 0b0011 = 0x0C)
+  // Reject non-GP frames: GP protocol version = 3, bits[5:2] = 0b0011 = 0x0C
   if ((nwkFc & 0x3C) != 0x0C) {
     return;
   }
 
   // GP Maintenance frame (0xE3 Channel Request): FT=1, ExtFC=0, AC=0
   bool isMaintenance = ((nwkFc & 0xC3) == 0x01);
-  // GP Data frame with rxAfterTx=1 (0xE0 Commissioning): FT=0, ExtFC=1, AC ignored
+
+  // GP Data commissioning frame (0xE0) with rxAfterTx=1:
+  //   NWK FC: FT=0, ExtFC present, AC bit ignored
+  //   ExtFC:  Direction=0 (from GPD), RxAfterTx=1
   bool isDataRxAfterTx = ((nwkFc & 0x83) == 0x80)
-                         && ((nwkEfc & 0xC0) == 0x40); // Dir=0, RxAfterTx=1
+                         && ((nwkEfc & 0xC0) == 0x40);
 
   if (!isMaintenance && !isDataRxAfterTx) {
     return;
   }
 
   // Compute dispatch latency since MAC reception.
-  // For NWK-type packets, sli_zigbee_current_mac_timestamp may be stale (set
-  // only for RAW_MAC frames in some SDK builds).  Fall back to elapsed=0 for
-  // isDataRxAfterTx so we still schedule RAIL2 TX at GP_RX_OFFSET_USEC.
+  //
+  // sli_zigbee_current_mac_timestamp is only updated for RAW_MAC frames (GP
+  // maintenance).  For NWK-layer frames (GP data, 0xE0) it retains the value
+  // from the last maintenance frame — potentially seconds old — making elapsed
+  // >> GP_RX_OFFSET_USEC.  Fall back to elapsed=0 so we still schedule RAIL2
+  // TX at GP_RX_OFFSET_USEC from now; the extra jitter (main-loop dispatch
+  // latency < 5 ms) is well within the GPD's 20 ms receive window.
   uint32_t elapsed = RAIL_GetTime() - sli_zigbee_current_mac_timestamp;
   if (elapsed >= GP_RX_OFFSET_USEC) {
     if (isDataRxAfterTx) {
-      elapsed = 0; // stale timestamp — schedule from now
+      elapsed = 0;
     } else {
-      return; // maintenance: window genuinely closed
+      return;
     }
   }
 
@@ -201,6 +195,7 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
                  sizeof(EmberGpSourceId));
   }
 
+  // Look for a pre-queued response frame in the GP TX stub queue
   EmberGpTxQueueEntry *entry = get_gp_stub_tx_queue(&gpdAddr);
   if (!entry) {
     return;
