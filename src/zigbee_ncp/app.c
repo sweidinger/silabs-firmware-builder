@@ -66,6 +66,10 @@ extern EmberMessageBuffer sli_zigbee_gpdf_make_header(bool useCca,
 // our sli_zigbee_af_packet_handoff_incoming_callback() fires.
 // Used to compensate for the main-loop dispatch latency so that RAIL2
 // schedules the GP response at exactly GP_RX_OFFSET_USEC after MAC reception.
+// NOTE: This global may only be updated for certain frame types (e.g. GP
+// maintenance frames).  For GP data frames (0xE0 commissioning), it may
+// retain a stale value from the previous maintenance frame.  The elapsed
+// computation below guards against this.
 extern uint32_t sli_zigbee_current_mac_timestamp;
 
 // Forward declaration
@@ -204,6 +208,16 @@ EmberPacketAction sli_zigbee_af_packet_handoff_incoming_callback(
  *    this callback.  We subtract it from RAIL_GetTime() to get the exact
  *    main-loop dispatch latency and schedule RAIL2 TX to fire at precisely
  *    GP_RX_OFFSET_USEC after MAC reception regardless of that latency.
+ *
+ *    IMPORTANT: sli_zigbee_current_mac_timestamp may NOT be updated for GP
+ *    data frames (0xE0 commissioning) in some SDK versions — only for GP
+ *    maintenance frames (0xE3 channel request).  When this happens, elapsed
+ *    will be the time since the last maintenance frame (potentially seconds),
+ *    which is >> GP_RX_OFFSET_USEC.  We handle this by falling back to
+ *    elapsed = 0 for bidirectional data frames (isDataRxAfterTx), so that
+ *    RAIL2 TX is scheduled at GP_RX_OFFSET_USEC from now.  The additional
+ *    jitter (main-loop dispatch latency, typically < 5 ms) is well within
+ *    the GPD's 20 ms receive window.
  */
 static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
                                       int8u *packetData,
@@ -233,9 +247,19 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   // sli_zigbee_current_mac_timestamp is a RAIL µs value written by the stack
   // in sli_zigbee_application_process_incoming() before our callback fires.
   uint32_t elapsed = RAIL_GetTime() - sli_zigbee_current_mac_timestamp;
+
   if (elapsed >= GP_RX_OFFSET_USEC) {
-    // Too late — the GPD receive window has already closed.
-    return;
+    if (isDataRxAfterTx) {
+      // sli_zigbee_current_mac_timestamp appears stale (not refreshed for GP
+      // data frames in this SDK version).  The value is from the last GP
+      // maintenance frame, making elapsed artificially large.
+      // Fall back: schedule from now.  The extra jitter equals the main-loop
+      // dispatch latency (< 5 ms), which is acceptable for the 20 ms window.
+      elapsed = 0;
+    } else {
+      // Maintenance: the GPD receive window has genuinely closed.
+      return;
+    }
   }
 
   // Extract GPD Source ID from the NWK frame (AppId = 0 assumed)
