@@ -35,6 +35,15 @@ void emberAfRadioNeedsCalibratingCallback(void)
 #define GP_RX_OFFSET_USEC 20500
 #endif
 
+// Short TX delay used when sli_zigbee_current_mac_timestamp is stale (0xE0
+// frames).  The packet-handoff callback dispatches from the main loop, which
+// adds several ms of latency after MAC reception.  Scheduling TX at only
+// GP_DATA_TX_DELAY_USEC from now keeps the transmission inside the GPD's
+// ~17 ms bidirectional receive window.
+#ifndef GP_DATA_TX_DELAY_USEC
+#define GP_DATA_TX_DELAY_USEC 2000
+#endif
+
 extern uint8_t sl_mac_lower_mac_get_radio_channel(uint8_t mac_index);
 extern EmberMessageBuffer sli_zigbee_gpdf_make_header(bool useCca,
                                                       EmberGpAddress *src,
@@ -63,18 +72,30 @@ void emberAfPluginMultirailDemoRailEventCallback(RAIL_Handle_t handle,
   (void)events;
 }
 
+// Look up and dequeue a GP TX stub entry for the given GPD address.
+//
+// The RAIL2 handle check is intentionally NOT performed here — we always
+// attempt the queue lookup and removal so that:
+//   a) dGpSentHandler fires on the host (visible in EZSP logs) regardless of
+//      whether RAIL2 is available, confirming the packet-handoff callback
+//      actually fired for the incoming GP data frame.
+//   b) The caller decides whether to proceed with RAIL2 TX or just drain the
+//      entry (diagnostic path when handle is NULL).
+//
+// Returns a pointer to a static EmberGpTxQueueEntry whose .asdu field holds
+// the built frame buffer (caller must release it), or NULL if no entry found.
 static EmberGpTxQueueEntry *get_gp_stub_tx_queue(EmberGpAddress *addr)
 {
   EmberGpTxQueueEntry sli_zigbee_gp_tx_queue;
+  MEMSET(&sli_zigbee_gp_tx_queue, 0, sizeof(EmberGpTxQueueEntry));
   MEMCOPY(&sli_zigbee_gp_tx_queue.addr, addr, sizeof(EmberGpAddress));
 
   uint8_t data[128];
   uint16_t dataLength;
 
-  if (emberAfPluginMultirailDemoGetHandle()
-      && emberGpGetTxQueueEntryFromQueue(&sli_zigbee_gp_tx_queue,
-                                         data, &dataLength, 128)
-         != EMBER_NULL_MESSAGE_BUFFER) {
+  if (emberGpGetTxQueueEntryFromQueue(&sli_zigbee_gp_tx_queue,
+                                      data, &dataLength, 128)
+      != EMBER_NULL_MESSAGE_BUFFER) {
     EmberMessageBuffer header = sli_zigbee_gpdf_make_header(
       true, NULL, &(sli_zigbee_gp_tx_queue.addr));
 
@@ -84,6 +105,9 @@ static EmberGpTxQueueEntry *get_gp_stub_tx_queue(EmberGpAddress *addr)
     emberSetLinkedBuffersLength(header,
                                 emberMessageBufferLength(header) + dataLength);
     emberCopyToLinkedBuffers(data, header, len, dataLength);
+
+    // Remove from queue now — this fires dGpSentHandler on the host,
+    // confirming the frame was dequeued (regardless of RAIL2 TX outcome).
     emberGpRemoveFromTxQueue(&sli_zigbee_gp_tx_queue);
 
     uint8_t outPktLength = emberMessageBufferLength(header);
@@ -168,24 +192,32 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   // Compute dispatch latency since MAC reception.
   //
   // sli_zigbee_current_mac_timestamp is only updated for RAW_MAC frames (GP
-  // maintenance).  For NWK-layer frames (GP data, 0xE0) it retains the value
-  // from the last maintenance frame — potentially seconds old — making elapsed
-  // >> GP_RX_OFFSET_USEC.  Fall back to elapsed=0 so we still schedule RAIL2
-  // TX at GP_RX_OFFSET_USEC from now; the extra jitter (main-loop dispatch
-  // latency < 5 ms) is well within the GPD's 20 ms receive window.
-  uint32_t elapsed = RAIL_GetTime() - sli_zigbee_current_mac_timestamp;
-  if (elapsed >= GP_RX_OFFSET_USEC) {
-    if (isDataRxAfterTx) {
-      elapsed = 0;
-    } else {
-      return;
+  // maintenance / 0xE3).  For NWK-layer GP data frames (0xE0) it retains the
+  // timestamp from the last 0xE3 — potentially seconds old — so elapsed will
+  // far exceed GP_RX_OFFSET_USEC.
+  //
+  // For maintenance frames (0xE3): use the accurate timestamp as usual.
+  // For data frames (0xE0): ignore the stale timestamp and schedule TX at
+  //   GP_DATA_TX_DELAY_USEC (2 ms) from now.  The main-loop dispatch latency
+  //   is typically 2–8 ms; adding only 2 ms keeps the total delay well inside
+  //   the GPD's ~17 ms bidirectional receive window.  Using the full
+  //   GP_RX_OFFSET_USEC (20.5 ms) from dispatch time would put the
+  //   transmission at ~25 ms from MAC reception — past the window.
+  uint32_t txDelay;
+  if (isDataRxAfterTx) {
+    txDelay = GP_DATA_TX_DELAY_USEC;
+  } else {
+    uint32_t elapsed = RAIL_GetTime() - sli_zigbee_current_mac_timestamp;
+    if (elapsed >= GP_RX_OFFSET_USEC) {
+      return;  // stale timestamp for maintenance frame — skip
     }
+    txDelay = GP_RX_OFFSET_USEC - elapsed;
   }
 
   // Extract GPD Source ID (AppId=0 assumed)
   EmberGpAddress gpdAddr;
+  MEMSET(&gpdAddr, 0, sizeof(EmberGpAddress));
   gpdAddr.applicationId = EMBER_GP_APPLICATION_SOURCE_ID;
-  gpdAddr.id.sourceId = 0;
 
   if (isDataRxAfterTx
       && ((nwkEfc & 0x07) == EMBER_GP_APPLICATION_SOURCE_ID)
@@ -195,15 +227,27 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
                  sizeof(EmberGpSourceId));
   }
 
-  // Look for a pre-queued response frame in the GP TX stub queue
+  // Look for a pre-queued response frame in the GP TX stub queue.
+  // Note: get_gp_stub_tx_queue always attempts the lookup and calls
+  // emberGpRemoveFromTxQueue, firing dGpSentHandler on the host even when
+  // RAIL2 is unavailable.  Check RAIL2 handle AFTER this call.
   EmberGpTxQueueEntry *entry = get_gp_stub_tx_queue(&gpdAddr);
   if (!entry) {
+    return;
+  }
+
+  // Guard RAIL2 TX: if the secondary RAIL handle is not yet initialised,
+  // the entry has already been dequeued (dGpSentHandler will fire on host)
+  // but we cannot transmit.  Release the frame buffer and bail.
+  if (!emberAfPluginMultirailDemoGetHandle()) {
+    emberReleaseMessageBuffer(entry->asdu);
     return;
   }
 
   uint8_t outPktLength = emberMessageBufferLength(entry->asdu);
   uint8_t outPkt[128];
   emberCopyFromLinkedBuffers(entry->asdu, 0, outPkt, outPktLength);
+  emberReleaseMessageBuffer(entry->asdu);
 
   RAIL_SchedulerInfo_t schedulerInfo = {
     .priority        = 50,
@@ -212,15 +256,13 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   };
   RAIL_ScheduleTxConfig_t scheduledTxConfig = {
     .mode = RAIL_TIME_DELAY,
-    .when = GP_RX_OFFSET_USEC - elapsed,
+    .when = txDelay,
   };
 
   (void)emberAfPluginMultirailDemoSend(
     outPkt, outPktLength,
     sl_mac_lower_mac_get_radio_channel(0),
     &scheduledTxConfig, &schedulerInfo);
-
-  emberGpRemoveFromTxQueue(entry);
 }
 
 #endif // SL_CATALOG_ZIGBEE_MULTIRAIL_DEMO_PRESENT
