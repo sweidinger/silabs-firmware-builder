@@ -120,10 +120,13 @@ void emberAfMainInitCallback(void)
 
 /** @brief RAIL2 event callback — track TX outcomes for debug reporting.
  *
- *  RAIL_EVENT_TX_PACKET_SENT:     frame was actually transmitted OTA  ✓
- *  RAIL_EVENT_SCHEDULED_TX_STARTED: RAIL accepted the scheduled slot (not yet TX'd)
- *  RAIL_EVENT_SCHEDULER_STATUS:   multi-protocol scheduler decision; non-SUCCESS
- *                                  means the slot was preempted/aborted.
+ *  Counters are visible via g_gp_dbg (accessible from a debugger or via
+ *  custom EZSP query).  On success, RAIL_EVENT_TX_PACKET_SENT fires;
+ *  on failure, RAIL_EVENT_SCHEDULER_STATUS fires with a non-zero status.
+ *
+ *  RAIL_EVENT_TX_PACKET_SENT:    frame physically transmitted OTA ✓
+ *  RAIL_EVENT_SCHEDULER_STATUS:  multi-protocol scheduler result
+ *                                (RAIL_SCHEDULER_STATUS_NO_ERROR = OK)
  */
 void emberAfPluginMultirailDemoRailEventCallback(RAIL_Handle_t handle,
                                                  RAIL_Events_t events)
@@ -132,7 +135,6 @@ void emberAfPluginMultirailDemoRailEventCallback(RAIL_Handle_t handle,
     if (events & RAIL_EVENT_TX_PACKET_SENT) {
       g_gp_dbg.rail2_tx_sent++;
     } else {
-      // TX completion but not PACKET_SENT → abort/error
       g_gp_dbg.rail2_tx_error++;
     }
     g_gp_dbg.dirty = true;
@@ -141,42 +143,11 @@ void emberAfPluginMultirailDemoRailEventCallback(RAIL_Handle_t handle,
   if (events & RAIL_EVENT_SCHEDULER_STATUS) {
     RAIL_SchedulerStatus_t s = RAIL_GetSchedulerStatus(handle);
     g_gp_dbg.last_sched_status = s;
-    if (s != RAIL_SCHEDULER_STATUS_SUCCESS) {
+    if (s != RAIL_SCHEDULER_STATUS_NO_ERROR) {
       g_gp_dbg.rail2_tx_error++;
       g_gp_dbg.dirty = true;
     }
   }
-}
-
-/** @brief Main tick — emit debug state when packet-handoff updated it.
- *
- *  Runs in the main loop (not interrupt context), safe for debug printing.
- *  Uses sl_zigbee_app_debug_print which routes output via EZSP debug channel
- *  to the host where bellows logs it.
- */
-void emberAfMainTickCallback(void)
-{
-  if (!g_gp_dbg.dirty) {
-    return;
-  }
-  g_gp_dbg.dirty = false;
-
-  // Print a structured one-line summary the host can parse easily.
-  // Format: GP-DBG result=N nwkFc=XX efc=XX srcId=XXXXXXXX cmdId=XX
-  //         rail2_sent=N rail2_err=N sched_status=N calls=N
-  sl_zigbee_app_debug_print(
-    "GP-DBG result=%d nwkFc=0x%x efc=0x%x srcId=0x%4x cmdId=0x%x"
-    " rail2_sent=%d rail2_err=%d sched_status=%d calls=%d\n",
-    (int)g_gp_dbg.result,
-    (unsigned)g_gp_dbg.last_nwk_fc,
-    (unsigned)g_gp_dbg.last_nwk_efc,
-    (unsigned long)g_gp_dbg.last_src_id,
-    (unsigned)g_gp_dbg.last_queue_cmd_id,
-    (int)g_gp_dbg.rail2_tx_sent,
-    (int)g_gp_dbg.rail2_tx_error,
-    (int)g_gp_dbg.last_sched_status,
-    (int)g_gp_dbg.call_count
-  );
 }
 
 /** @brief Retrieve and serialise one entry from the dGpSend TX queue for the
