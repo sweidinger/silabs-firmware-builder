@@ -65,7 +65,9 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
                                       int8u *packetData,
                                       int8u size_p);
 
-// Microseconds elapsed since MAC received the packet
+// Microseconds elapsed since MAC received the packet.
+// NOTE: Only valid when macTimeStamp is a reliable per-packet RAIL timestamp.
+// For GP commissioning frames (0xE0, 0xE3) it is typically stale — see below.
 #define macToAppDelay(macTimeStamp) \
   ((RAIL_GetTime() & 0x00FFFFFF) - (macTimeStamp))
 
@@ -220,34 +222,23 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
     return;
   }
 
-  // Extract the MAC timestamp appended by the stack (24-bit, big-endian).
-  // NOTE: sli_zigbee_current_mac_timestamp is only reliable for frames that
-  // the standard GP stack processes (e.g. 0xE3 channel requests via GP Proxy).
-  // For 0xE0 commissioning frames the timestamp is stale (it still holds the
-  // value from the last GP-stack-processed frame), making macToAppDelay()
-  // return a garbage large value → the timing guard below would always fire.
+  // Always schedule at GP_RX_OFFSET_USEC from "now" — do NOT use
+  // macToAppDelay() for commissioning frames.
   //
-  // Fix: for MAINTENANCE frames (isMaintenance=true), skip the elapsed-time
-  // guard and always schedule at GP_RX_OFFSET_USEC from NOW.  The packet
-  // handoff callback fires within ~200 µs of MAC frame receipt, so scheduling
-  // GP_RX_OFFSET_USEC (20.5 ms) from "now" is effectively the same as
-  // GP_RX_OFFSET_USEC from "MAC frame received".
-  const uint32_t macTimeStamp = ((uint32_t)packetData[size_p - 3] << 16)
-                                + ((uint32_t)packetData[size_p - 2] << 8)
-                                + (uint32_t)packetData[size_p - 1];
-
-  uint32_t scheduleWhen;
-  if (isMaintenance) {
-    // Fixed offset for maintenance frames — MAC timestamp unreliable for 0xE0.
-    scheduleWhen = GP_RX_OFFSET_USEC;
-  } else {
-    uint32_t elapsed = macToAppDelay(macTimeStamp);
-    if (elapsed >= GP_RX_OFFSET_USEC) {
-      // Too late — the GPD receive window has already closed
-      return;
-    }
-    scheduleWhen = GP_RX_OFFSET_USEC - elapsed;
-  }
+  // The timestamp appended to 0xE0/0xE3 frames in the packet buffer is sourced
+  // from the GP-proxy global sli_zigbee_current_mac_timestamp, which is only
+  // refreshed when the GP proxy subsystem processes an 0xE3 Channel Request.
+  //
+  // For 0xE0 Commissioning Data frames the GP proxy does NOT update that
+  // global, so it still holds the timestamp from the previous 0xE3 (seconds
+  // ago).  macToAppDelay() then returns a huge elapsed value >> GP_RX_OFFSET_USEC,
+  // triggering an early return BEFORE the queue lookup — RAIL2 never fires.
+  //
+  // The packet-handoff callback is invoked within ~200 µs of MAC frame receipt
+  // (synchronous with the MAC interrupt chain), so scheduling GP_RX_OFFSET_USEC
+  // (20.5 ms) from "now" is accurate enough to hit the GPD receive window for
+  // both 0xE3 Maintenance frames and 0xE0 Data frames.
+  const uint32_t scheduleWhen = GP_RX_OFFSET_USEC;
 
   // Extract GPD Source ID from the NWK frame (AppId = 0 assumed)
   EmberGpAddress gpdAddr;
@@ -256,17 +247,13 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
 
   if (isDataRxAfterTx
       && ((nwkEfc & 0x07) == EMBER_GP_APPLICATION_SOURCE_ID)) {
-    // Data frame with Extended NWK FC: SrcID at bytes [9..12]
+    // 0xE0 Commissioning: GP Data frame with ExtFC byte present.
+    // Layout: [7]=NWK FC, [8]=NWK ExtFC, [9..12]=SrcID
     (void)memcpy(&gpdAddr.id.sourceId, &packetData[9],
                  sizeof(EmberGpSourceId));
   } else if (isMaintenance && size_p > 12) {
-    // Maintenance frames (0xE0 commissioning, 0xE3 channel request, etc.) have
-    // no Extended NWK FC byte.  SrcID immediately follows the NWK FC byte:
-    //   [7]    = NWK FC
-    //   [8-11] = SrcID (0x00000000 for 0xE3 broadcast; actual SrcID for 0xE0)
-    // Without this extraction the queue lookup always uses SrcID=0, which finds
-    // the pre-queued 0xF3 (also keyed to SrcID=0) but NOT the pre-queued 0xF0
-    // (keyed to the GPD's specific SrcID, e.g. 0x917FD200).
+    // 0xE3 Channel Request: GP Maintenance frame, no ExtFC byte.
+    // Layout: [7]=NWK FC, [8..11]=SrcID (0x00000000 = broadcast for 0xE3)
     (void)memcpy(&gpdAddr.id.sourceId, &packetData[8],
                  sizeof(EmberGpSourceId));
   }
