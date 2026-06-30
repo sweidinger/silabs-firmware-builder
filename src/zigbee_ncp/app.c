@@ -276,9 +276,15 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   g_gp_dbg.result = DBG_RESULT_NOT_GP;
   g_gp_dbg.dirty  = true;
 
-  bool isMaintenance = ((nwkFc & 0xC3) == 0x01);  // FT=1, ExtFC=0, AC=0
-  bool isDataRxAfterTx = ((nwkFc & 0xC3) == 0x80) // FT=0, ExtFC=1, AC=0
-                         && ((nwkEfc & 0xC0) == 0x40); // Dir=0, rxAfterTx=1
+  bool isMaintenance = ((nwkFc & 0xC3) == 0x01);  // FT=1, NFCE=0, AC=don't-care
+  // FIX 2026-06-30: CL110 sets AC=1 (Auto Commissioning / button-press) in its 0xE0.
+  // Old mask 0xC3 checked bit6=AC=0, failing for CL110 (nwkFc=0xCC → 0xC0 ≠ 0x80).
+  // New mask 0x83 ignores bit6 so AC=0 and AC=1 devices both match.
+  // RxAfterTx is bit7 of nwkEfc; CL110 sends nwkEfc=0x9C (RxAfterTx=1, KeyType=1, SecLvl=3).
+  // Old condition (nwkEfc & 0xC0)==0x40 required bit7=0,bit6=1 → never true for CL110.
+  // New condition (nwkEfc & 0x80)==0x80 directly tests the RxAfterTx bit.
+  bool isDataRxAfterTx = ((nwkFc & 0x83) == 0x80) // FT=0 (Data), NFCE=1, AC=don't-care
+                         && ((nwkEfc & 0x80) == 0x80); // RxAfterTx=1 (bit7)
 
   if (!isMaintenance && !isDataRxAfterTx) {
     g_gp_dbg.result = DBG_RESULT_NO_MATCH;
