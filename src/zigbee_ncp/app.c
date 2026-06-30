@@ -314,14 +314,25 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   gpdAddr.applicationId = EMBER_GP_APPLICATION_SOURCE_ID;
   gpdAddr.id.sourceId = 0;
 
+  // For 0xE0 Data frames with security, the Security Frame Counter is at [13..16].
+  // We need to patch this into the pre-queued 0xF0 ASDU so the GPD accepts it.
+  // ZGP spec A.3.3.5.3: GPD checks FC(0xF0) >= its own stored FC.
+  // If we send the startup-cached counter (which predates the actual 0xE0), the
+  // GPD rejects the 0xF0 as a replay.  Patch with the exact FC from the 0xE0.
+  uint32_t gpd_security_fc = 0;
+
   if (isDataRxAfterTx
       && ((nwkEfc & 0x03) == EMBER_GP_APPLICATION_SOURCE_ID)) {
     // 0xE0 Commissioning: GP Data frame with ExtFC byte present.
     // AppID is bits 0-1 only (mask 0x03); bit2 is LSB of Security Level.
     // Old mask 0x07 included bit2, so (0x9C & 0x07)=0x04 ≠ 0 → SrcID never extracted.
-    // Layout: [7]=NWK FC, [8]=NWK ExtFC, [9..12]=SrcID
+    // Layout: [7]=NWK FC, [8]=NWK ExtFC, [9..12]=SrcID, [13..16]=Security FC
     (void)memcpy(&gpdAddr.id.sourceId, &packetData[9],
                  sizeof(EmberGpSourceId));
+    // Extract Security Frame Counter for 0xF0 ASDU patching
+    if (size_p > 16) {
+      (void)memcpy(&gpd_security_fc, &packetData[13], sizeof(uint32_t));
+    }
   } else if (isMaintenance && size_p > 12) {
     // 0xE3 Channel Request: GP Maintenance frame, no ExtFC byte.
     // Layout: [7]=NWK FC, [8..11]=SrcID (0x00000000 = broadcast for 0xE3)
@@ -342,6 +353,24 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   uint8_t outPktLength = emberMessageBufferLength(entry->asdu);
   uint8_t outPkt[128];
   emberCopyFromLinkedBuffers(entry->asdu, 0, outPkt, outPktLength);
+
+  // Patch the Security Frame Counter in the 0xF0 ASDU.
+  // The pre-queued 0xF0 was built with an estimated FC (last seen + margin).
+  // The actual FC from this 0xE0 must be echoed back so the GPD's FC check passes.
+  // GP Commissioning Reply ASDU: [cmd_id(1)] [options(1)] [FC(4)] [enc_key(16)] [MIC(4)]
+  // The key_MIC nonce is SrcID||SrcID||SrcID||0x05 — FC-independent, so MIC stays valid.
+  // Scan outPkt for the 0xF0 command byte (starting after MAC header at ~byte 8):
+  if (g_gp_dbg.last_queue_cmd_id == 0xF0 && gpd_security_fc != 0) {
+    for (uint8_t fi = 8; fi < outPktLength && fi + 6 < 128; fi++) {
+      if (outPkt[fi] == 0xF0) {
+        // outPkt[fi]   = GP command ID 0xF0
+        // outPkt[fi+1] = options byte (0x06)
+        // outPkt[fi+2..fi+5] = Security Frame Counter (LE) ← PATCH
+        (void)memcpy(&outPkt[fi + 2], &gpd_security_fc, sizeof(uint32_t));
+        break;
+      }
+    }
+  }
 
   // Schedule RAIL2 transmission to hit the GPD receive window exactly
   RAIL_SchedulerInfo_t schedulerInfo = {
