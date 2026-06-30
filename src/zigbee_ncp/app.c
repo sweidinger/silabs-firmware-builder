@@ -315,8 +315,10 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   gpdAddr.id.sourceId = 0;
 
   if (isDataRxAfterTx
-      && ((nwkEfc & 0x07) == EMBER_GP_APPLICATION_SOURCE_ID)) {
+      && ((nwkEfc & 0x03) == EMBER_GP_APPLICATION_SOURCE_ID)) {
     // 0xE0 Commissioning: GP Data frame with ExtFC byte present.
+    // AppID is bits 0-1 only (mask 0x03); bit2 is LSB of Security Level.
+    // Old mask 0x07 included bit2, so (0x9C & 0x07)=0x04 ≠ 0 → SrcID never extracted.
     // Layout: [7]=NWK FC, [8]=NWK ExtFC, [9..12]=SrcID
     (void)memcpy(&gpdAddr.id.sourceId, &packetData[9],
                  sizeof(EmberGpSourceId));
