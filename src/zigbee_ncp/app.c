@@ -277,14 +277,34 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   g_gp_dbg.dirty  = true;
 
   bool isMaintenance = ((nwkFc & 0xC3) == 0x01);  // FT=1, NFCE=0, AC=don't-care
-  // FIX 2026-06-30: CL110 sets AC=1 (Auto Commissioning / button-press) in its 0xE0.
-  // Old mask 0xC3 checked bit6=AC=0, failing for CL110 (nwkFc=0xCC → 0xC0 ≠ 0x80).
-  // New mask 0x83 ignores bit6 so AC=0 and AC=1 devices both match.
-  // RxAfterTx is bit7 of nwkEfc; CL110 sends nwkEfc=0x9C (RxAfterTx=1, KeyType=1, SecLvl=3).
-  // Old condition (nwkEfc & 0xC0)==0x40 required bit7=0,bit6=1 → never true for CL110.
-  // New condition (nwkEfc & 0x80)==0x80 directly tests the RxAfterTx bit.
-  bool isDataRxAfterTx = ((nwkFc & 0x83) == 0x80) // FT=0 (Data), NFCE=1, AC=don't-care
-                         && ((nwkEfc & 0x80) == 0x80); // RxAfterTx=1 (bit7)
+
+  // FIX 2026-07-01: Use GP application-layer Options.RxAfterTx (bit4 of GP payload[0])
+  // as the bidirectionality indicator for 0xE0 Commissioning frames.
+  //
+  // HISTORY OF FAILED APPROACHES:
+  //   Attempt 1 (old mask 0xC3 on nwkFc): failed — CL110 sets AC=1 (bit6), so
+  //     (nwkFc=0xCC → 0xC0 ≠ 0x80) was never true.
+  //   Attempt 2 (0x83 on nwkFc + 0x80 on nwkEfc, "FIX 2026-06-30"): failed — checked
+  //     bit7 of nwkEfc (Direction bit per ZGP spec), but the CL110 does NOT set bit7
+  //     of the NWK ExtFC to signal bidirectionality.
+  //
+  // ROOT CAUSE: The RELIABLE RxAfterTx indicator is in the GP Application layer, not
+  // the NWK ExtFC layer. ZGP spec: the GP Commissioning GPDF Options byte (first byte
+  // of the GP command payload) has RxAfterTx at bit4. The EZSP stack reads this byte
+  // to populate EmberGpFrame.bidirectionalInfo. The CL110 sends Options=0x30 which has
+  // bit4=1 (RxAfterTx=1), while the NWK ExtFC encoding may vary by implementation.
+  //
+  // MAC frame layout for GP Data frame with ExtFC (AppID=0, SrcID-based):
+  //   [0-1]=MAC FCF, [2]=Seq, [3-4]=DstPAN, [5-6]=DstAddr (0xFFFF broadcast)
+  //   [7]=NWK FC (0xCC for CL110), [8]=NWK ExtFC, [9-12]=SrcID LE
+  //   [13]=GP Command ID (0xE0), [14]=GP Options byte (0x30 for CL110)
+  // Options bit4 = RxAfterTx = 1 → GPD is listening for our 0xF0 reply.
+  bool isDataRxAfterTx =
+    ((nwkFc & 0x83) == 0x80)                                // GP Data frame, ExtFC present, AC=x
+    && ((nwkEfc & 0x03) == EMBER_GP_APPLICATION_SOURCE_ID)  // AppID=0 (SrcID-based GPD)
+    && (size_p > 14)                                         // packet long enough for Options byte
+    && (packetData[13] == 0xE0)                              // GP Commissioning command
+    && ((packetData[14] & 0x10) != 0);                      // Options.RxAfterTx = bit4
 
   if (!isMaintenance && !isDataRxAfterTx) {
     g_gp_dbg.result = DBG_RESULT_NO_MATCH;
@@ -316,10 +336,10 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
 
   if (isDataRxAfterTx
       && ((nwkEfc & 0x03) == EMBER_GP_APPLICATION_SOURCE_ID)) {
-    // 0xE0 Commissioning: GP Data frame with ExtFC byte present.
-    // AppID is bits 0-1 only (mask 0x03); bit2 is LSB of Security Level.
-    // Old mask 0x07 included bit2, so (0x9C & 0x07)=0x04 ≠ 0 → SrcID never extracted.
-    // Layout: [7]=NWK FC, [8]=NWK ExtFC, [9..12]=SrcID
+    // 0xE0 Commissioning: GP Data frame with ExtFC byte present, AppID=0.
+    // isDataRxAfterTx already verified AppID=0, but the check here is kept for
+    // documentation clarity.  AppID is bits[1:0] of nwkEfc (mask 0x03).
+    // Layout: [7]=NWK FC, [8]=NWK ExtFC, [9..12]=SrcID LE
     (void)memcpy(&gpdAddr.id.sourceId, &packetData[9],
                  sizeof(EmberGpSourceId));
   } else if (isMaintenance && size_p > 12) {
