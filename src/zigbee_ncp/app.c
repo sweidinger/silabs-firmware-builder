@@ -314,25 +314,14 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   gpdAddr.applicationId = EMBER_GP_APPLICATION_SOURCE_ID;
   gpdAddr.id.sourceId = 0;
 
-  // For 0xE0 Data frames with security, the Security Frame Counter is at [13..16].
-  // We need to patch this into the pre-queued 0xF0 ASDU so the GPD accepts it.
-  // ZGP spec A.3.3.5.3: GPD checks FC(0xF0) >= its own stored FC.
-  // If we send the startup-cached counter (which predates the actual 0xE0), the
-  // GPD rejects the 0xF0 as a replay.  Patch with the exact FC from the 0xE0.
-  uint32_t gpd_security_fc = 0;
-
   if (isDataRxAfterTx
       && ((nwkEfc & 0x03) == EMBER_GP_APPLICATION_SOURCE_ID)) {
     // 0xE0 Commissioning: GP Data frame with ExtFC byte present.
     // AppID is bits 0-1 only (mask 0x03); bit2 is LSB of Security Level.
     // Old mask 0x07 included bit2, so (0x9C & 0x07)=0x04 ≠ 0 → SrcID never extracted.
-    // Layout: [7]=NWK FC, [8]=NWK ExtFC, [9..12]=SrcID, [13..16]=Security FC
+    // Layout: [7]=NWK FC, [8]=NWK ExtFC, [9..12]=SrcID
     (void)memcpy(&gpdAddr.id.sourceId, &packetData[9],
                  sizeof(EmberGpSourceId));
-    // Extract Security Frame Counter for 0xF0 ASDU patching
-    if (size_p > 16) {
-      (void)memcpy(&gpd_security_fc, &packetData[13], sizeof(uint32_t));
-    }
   } else if (isMaintenance && size_p > 12) {
     // 0xE3 Channel Request: GP Maintenance frame, no ExtFC byte.
     // Layout: [7]=NWK FC, [8..11]=SrcID (0x00000000 = broadcast for 0xE3)
@@ -354,24 +343,34 @@ static void appGpScheduleOutgoingGpdf(EmberZigbeePacketType packetType,
   uint8_t outPkt[128];
   emberCopyFromLinkedBuffers(entry->asdu, 0, outPkt, outPktLength);
 
-  // Patch the Security Frame Counter in the 0xF0 ASDU.
-  // The pre-queued 0xF0 was built with an estimated FC (last seen + margin).
-  // The actual FC from this 0xE0 must be echoed back so the GPD's FC check passes.
-  // GP Commissioning Reply ASDU: [cmd_id(1)] [options(1)] [FC(4)] [enc_key(16)] [MIC(4)]
-  // The key_MIC nonce is SrcID||SrcID||SrcID||0x05 — FC-independent, so MIC stays valid.
-  // Scan outPkt for the 0xF0 command byte (starting after MAC header at ~byte 8):
-  if (g_gp_dbg.last_queue_cmd_id == 0xF0 && gpd_security_fc != 0) {
-    for (uint8_t fi = 8; fi < outPktLength && fi + 6 < 128; fi++) {
-      if (outPkt[fi] == 0xF0) {
-        // outPkt[fi]   = GP command ID 0xF0
-        // outPkt[fi+1] = options byte (0x06)
-        // outPkt[fi+2..fi+5] = Security Frame Counter (LE) ← PATCH
-        (void)memcpy(&outPkt[fi + 2], &gpd_security_fc, sizeof(uint32_t));
-        break;
-      }
-    }
-  }
-
+  // NOTE: FC patching removed (2026-07-01).
+  //
+  // The original block attempted to patch the Security Frame Counter in the
+  // pre-queued 0xF0 ASDU by scanning outPkt for the 0xF0 command byte and
+  // overwriting bytes at offset +2 with gpd_security_fc.  This was wrong for
+  // two independent reasons:
+  //
+  //   1. WRONG ASDU FORMAT ASSUMPTION.
+  //      The block assumed: options(1) | FC(4) | enc_key(16) | MIC(4).
+  //      Our host builds:  options(1) | enc_key(16) | MIC(4) | FC(4)  (ZGP spec A.3.3.5.2).
+  //      Offset fi+2 therefore hits enc_key[0:4], not the FC field.
+  //      → The first 4 bytes of the encrypted NWK key were silently trashed.
+  //
+  //   2. NONCE IS FC-DEPENDENT.
+  //      The block's comment claimed "nonce is SrcID||SrcID||SrcID||0x05 —
+  //      FC-independent, so MIC stays valid after patching FC."  That nonce
+  //      formula is wrong.  The actual GSDK TC-LK nonce is:
+  //          0x00000000 || SrcID_LE || FC_LE || 0x05
+  //      which IS FC-dependent.  Even if the FC were patched at the correct
+  //      ASDU offset, the MIC would be invalid for the patched FC value.
+  //
+  // The host already ensures the 0xF0 ASDU contains the correct FC via
+  // periodic re-queuing (~1 s interval, FC incremented by 256 each call).
+  // At the time the 0xE0 arrives the queued ASDU has FC = raw_counter + 1,
+  // which satisfies the GPD's FC check (FC_received > FC_stored).
+  // The enc_key and MIC were computed with that same FC in the nonce, so
+  // the CL110 can verify and accept the commissioning reply.
+  //
   // Schedule RAIL2 transmission to hit the GPD receive window exactly
   RAIL_SchedulerInfo_t schedulerInfo = {
     .priority        = 50,
